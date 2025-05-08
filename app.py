@@ -1,7 +1,6 @@
 from flask import Flask, render_template, request, jsonify
 import requests
 import os
-import json
 import logging
 
 # Configure logging
@@ -11,100 +10,88 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Configuration
-# The API Gateway URL should be in the format: https://[api-id].execute-api.[region].amazonaws.com/[stage]
-API_GATEWAY_BASE_URL = 'https://riau15k291.execute-api.us-east-1.amazonaws.com/default/genai-app-april'
+API_GATEWAY_URL = os.environ.get('API_GATEWAY_URL', 'https://your-api-gateway-url.execute-api.region.amazonaws.com/stage')
 
 @app.route('/')
-def home():
+def index():
     return render_template('index.html')
 
-@app.route('/search', methods=['POST'])
+@app.route('/api/search', methods=['POST'])
 def search():
     try:
-        # Log the raw request data
-        raw_data = request.get_data()
-        logger.info(f"Raw request data: {raw_data}")
-        
-        # Parse the request data
-        try:
-            data = request.json
-            logger.info(f"Parsed request JSON: {data}")
-        except Exception as e:
-            logger.error(f"Error parsing JSON: {str(e)}")
-            return jsonify({'error': 'Invalid JSON format'}), 400
-        
-        # Extract query from the request data
-        query = None
-        if isinstance(data, dict):
-            if 'query' in data:
-                query = data['query']
-            elif 'body' in data and isinstance(data['body'], dict) and 'query' in data['body']:
-                query = data['body']['query']
-        
-        logger.info(f"Extracted query: {query}")
+        data = request.get_json()
+        query = data.get('query', '')
         
         if not query:
-            logger.error("No query found in request data")
             return jsonify({'error': 'Query is required'}), 400
-        
-        # Construct the full API URL
-        api_url = API_GATEWAY_BASE_URL
-        logger.info(f"Making request to API URL: {api_url}")
-        
-        # Format the request body for the Lambda function
-        request_body = {
-            "query": query  # Send the query directly without nesting
-        }
-        
-        logger.info(f"Sending request body to API Gateway: {request_body}")
-        
+
+        # Enhance query for better results
+        enhanced_query = query
+        if 'hospital' in query.lower():
+            # For hospital-specific queries, ask for all available packages
+            enhanced_query = f"{query} Please list all available health checkup packages with their prices and features."
+        else:
+            # For general queries, include budget and hospital comparison
+            if 'budget' not in query.lower() and 'price' not in query.lower() and 'cost' not in query.lower():
+                enhanced_query = f"{query} Please include prices and budget options."
+            if 'hospital' not in query.lower() and 'clinic' not in query.lower():
+                enhanced_query = f"{enhanced_query} Please compare packages from different hospitals."
+
+        # Call API Gateway (which triggers Lambda)
         response = requests.post(
-            api_url,
-            json=request_body,
+            API_GATEWAY_URL,
+            json={'query': enhanced_query},
             headers={
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            },
-            timeout=30
+                'Content-Type': 'application/json'
+            }
         )
         
-        logger.info(f"API Gateway Response Status: {response.status_code}")
-        logger.info(f"API Gateway Response: {response.text}")
+        if response.status_code == 200:
+            result = response.json()
+            
+            # If no packages found, try a more specific query
+            if not result.get('packages') or (len(result['packages']) == 1 and 
+                result['packages'][0]['hospital'] == 'Information Available'):
+                logger.info("No packages found, trying more specific query")
+                specific_query = f"List all health checkup packages and their prices from {query}"
+                response = requests.post(
+                    API_GATEWAY_URL,
+                    json={'query': specific_query},
+                    headers={'Content-Type': 'application/json'}
+                )
+                if response.status_code == 200:
+                    result = response.json()
+            
+            return jsonify(result)
+        else:
+            logger.error(f"API Gateway error: {response.text}")
+            return jsonify({'error': 'Failed to get package recommendations'}), 500
+
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/hospitals', methods=['GET'])
+def get_hospitals():
+    """Get list of hospitals with available packages"""
+    try:
+        # Call Lambda function with a query to get hospital list
+        response = requests.post(
+            API_GATEWAY_URL,
+            json={'query': 'List all hospitals with their available health checkup packages'}
+        )
         
         if response.status_code == 200:
-            try:
-                response_data = response.json()
-                return jsonify(response_data)
-            except json.JSONDecodeError as e:
-                logger.error(f"Error decoding JSON response: {str(e)}")
-                return jsonify({'error': 'Invalid response format from API'}), 500
-        elif response.status_code == 404:
-            logger.error(f"API endpoint not found: {api_url}")
-            return jsonify({
-                'error': f'API endpoint not found. Please check the API Gateway configuration. URL: {api_url}'
-            }), 404
+            result = response.json()
+            # Extract unique hospitals from packages
+            hospitals = list(set(pkg['hospital'] for pkg in result.get('packages', [])))
+            return jsonify({'hospitals': hospitals})
         else:
-            error_message = f"API request failed with status {response.status_code}"
-            try:
-                error_data = response.json()
-                if 'error' in error_data:
-                    error_message = error_data['error']
-            except:
-                pass
-            logger.error(f"API Error: {error_message}")
-            return jsonify({'error': error_message}), response.status_code
-            
-    except requests.exceptions.Timeout:
-        logger.error("API request timed out")
-        return jsonify({'error': 'Request timed out. Please try again.'}), 504
-    except requests.exceptions.ConnectionError:
-        logger.error("Failed to connect to API")
-        return jsonify({'error': 'Failed to connect to API. Please check your connection.'}), 503
+            return jsonify({'error': 'Failed to get hospital list'}), 500
+
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
+        logger.error(f"Error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    # Print the API Gateway URL at startup for verification
-    logger.info(f"API Gateway Base URL: {API_GATEWAY_BASE_URL}")
     app.run(debug=True) 

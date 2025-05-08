@@ -16,10 +16,23 @@ REGION = os.environ['AWS_RGN']
 def retrieve_and_generate(input_text, kb_id, session_id=None):
     model_arn = f'arn:aws:bedrock:{REGION}::foundation-model/{MODEL_ID}'
     
+    # Enhance the query to get structured information
+    enhanced_query = f"""Please provide detailed information about health checkup packages in the following format:
+    Hospital Name: [hospital name]
+    Package Name: [package name]
+    Price: [price in INR]
+    Description: [brief description]
+    Features:
+    - [feature 1]
+    - [feature 2]
+    - [feature 3]
+
+    Query: {input_text}"""
+    
     try:
         if session_id:
             response = bedrock_agent_client.retrieve_and_generate(
-                input={'text': input_text},
+                input={'text': enhanced_query},
                 retrieveAndGenerateConfiguration={
                     'type': 'KNOWLEDGE_BASE',
                     'knowledgeBaseConfiguration': {
@@ -31,7 +44,7 @@ def retrieve_and_generate(input_text, kb_id, session_id=None):
             )
         else:
             response = bedrock_agent_client.retrieve_and_generate(
-                input={'text': input_text},
+                input={'text': enhanced_query},
                 retrieveAndGenerateConfiguration={
                     'type': 'KNOWLEDGE_BASE',
                     'knowledgeBaseConfiguration': {
@@ -41,8 +54,6 @@ def retrieve_and_generate(input_text, kb_id, session_id=None):
                 }
             )
         
-        # Print the raw response for debugging
-        print("Raw Bedrock Response:", json.dumps(response, indent=2))
         return response
     except Exception as e:
         print(f"Error in retrieve_and_generate: {str(e)}")
@@ -51,144 +62,93 @@ def retrieve_and_generate(input_text, kb_id, session_id=None):
 def parse_bedrock_response(response):
     """Parse the Bedrock response and structure it for the frontend"""
     try:
-        # Print the response structure for debugging
-        print("Response structure:", json.dumps(response, indent=2))
-        
         generated_text = response['output']['text']
-        print("Generated text:", generated_text)
         
         # Extract packages from the generated text
         packages = []
+        current_package = None
         
-        # Split the response into sections
-        sections = generated_text.split('\n\n')
+        # Split the response into lines
+        lines = generated_text.split('\n')
         
-        for section in sections:
-            # Skip empty sections
-            if not section.strip():
+        for line in lines:
+            line = line.strip()
+            if not line:
                 continue
-                
-            # Initialize package dictionary
-            package = {
-                'hospital': 'Information Available',
-                'description': '',
-                'features': [],
-                'price': 'Contact for pricing'
-            }
             
-            # Process each line in the section
-            lines = section.split('\n')
-            current_key = None
+            # Check for new package section
+            if line.startswith('Hospital Name:') or line.startswith('Package Name:'):
+                if current_package and (current_package['hospital'] != 'Information Available' or 
+                                      current_package['description'] or 
+                                      current_package['features']):
+                    packages.append(current_package)
+                
+                current_package = {
+                    'hospital': 'Information Available',
+                    'description': '',
+                    'features': [],
+                    'price': 'Contact for pricing'
+                }
             
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                # Try to identify the type of information in the line
-                lower_line = line.lower()
-                
-                # Check for hospital name
-                if any(keyword in lower_line for keyword in ['hospital', 'medical center', 'clinic', 'healthcare']):
-                    # Extract hospital name - take everything after the keyword
-                    for keyword in ['hospital', 'medical center', 'clinic', 'healthcare']:
-                        if keyword in lower_line:
-                            parts = line.split(keyword, 1)
-                            if len(parts) > 1:
-                                package['hospital'] = parts[1].strip()
-                            else:
-                                package['hospital'] = line
-                            break
-                
-                # Check for price
-                elif '₹' in line or 'rs' in lower_line or 'inr' in lower_line:
-                    # Extract price
-                    price = line
-                    if '₹' in line:
-                        price = line.split('₹')[-1].strip()
-                    elif 'rs' in lower_line:
-                        price = line.split('rs')[-1].strip()
-                    elif 'inr' in lower_line:
-                        price = line.split('inr')[-1].strip()
-                    
-                    # Clean up price
-                    price = price.replace(',', '').strip()
-                    if price.replace('.', '').isdigit():
-                        package['price'] = price
-                
-                # Check for description
-                elif any(keyword in lower_line for keyword in ['package', 'checkup', 'health', 'renal', 'cardiac', 'diabetes']):
-                    if not package['description']:
-                        package['description'] = line
-                
-                # Check for features/includes
-                elif any(keyword in lower_line for keyword in ['includes', 'features', 'tests', 'services']):
-                    current_key = 'features'
-                    # Extract features from the same line if they exist after the keyword
-                    for keyword in ['includes', 'features', 'tests', 'services']:
-                        if keyword in lower_line:
-                            parts = line.split(keyword, 1)
-                            if len(parts) > 1 and parts[1].strip():
-                                features = [f.strip() for f in parts[1].split(',')]
-                                package['features'].extend(features)
-                
-                # If we're in features mode, add the line as a feature
-                elif current_key == 'features':
-                    if line and not any(keyword in lower_line for keyword in ['hospital', 'price', 'package']):
-                        package['features'].append(line)
-            
-            # Only add the package if we have some meaningful information
-            if (package['hospital'] != 'Information Available' or 
-                package['description'] or 
-                package['features'] or 
-                package['price'] != 'Contact for pricing'):
-                packages.append(package)
+            # Parse package information
+            if current_package:
+                if line.startswith('Hospital Name:'):
+                    current_package['hospital'] = line.replace('Hospital Name:', '').strip()
+                elif line.startswith('Package Name:'):
+                    current_package['description'] = line.replace('Package Name:', '').strip()
+                elif line.startswith('Price:'):
+                    price = line.replace('Price:', '').strip()
+                    if '₹' in price:
+                        price = price.split('₹')[-1].strip()
+                    current_package['price'] = price
+                elif line.startswith('Description:'):
+                    current_package['description'] = line.replace('Description:', '').strip()
+                elif line.startswith('- '):
+                    feature = line.replace('- ', '').strip()
+                    if feature:
+                        current_package['features'].append(feature)
         
-        # If no packages were found, create a default package with the raw response
+        # Add the last package if exists
+        if current_package and (current_package['hospital'] != 'Information Available' or 
+                              current_package['description'] or 
+                              current_package['features']):
+            packages.append(current_package)
+        
+        # If no packages were found, try to extract information from the raw text
         if not packages:
+            # Look for hospital name in the text
+            hospital_name = None
+            for line in lines:
+                if 'hospital' in line.lower() or 'medical center' in line.lower():
+                    hospital_name = line.strip()
+                    break
+            
             packages.append({
-                'hospital': 'Information Available',
+                'hospital': hospital_name or 'Information Available',
                 'description': generated_text,
                 'features': ['Please contact the hospital for detailed package information'],
                 'price': 'Contact for pricing'
             })
         
         return {
-            'packages': packages,
-            'raw_response': generated_text  # Include raw response for debugging
+            'packages': packages
         }
     except Exception as e:
         print(f"Error in parse_bedrock_response: {str(e)}")
         return {
-            'error': f'Error parsing response: {str(e)}',
-            'raw_response': str(response)  # Include raw response for debugging
+            'error': f'Error parsing response: {str(e)}'
         }
 
 def lambda_handler(event, context):
     try:
         # Get the query from the request
         body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
-        
-        # Handle different request formats
-        if 'body' in body:
-            # Format: {"body": {"query": "..."}}
-            query = body['body'].get('query')
-        else:
-            # Format: {"query": "..."}
-            query = body.get('query')
+        query = body.get('query')
         
         if not query:
             return {
                 'statusCode': 400,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Methods': 'POST,OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type'
-                },
-                'body': json.dumps({
-                    'error': 'Query is required. Please provide a query in the request body.'
-                })
+                'body': json.dumps({'error': 'Query is required'})
             }
         
         # Call Bedrock
@@ -218,7 +178,5 @@ def lambda_handler(event, context):
                 'Access-Control-Allow-Methods': 'POST,OPTIONS',
                 'Access-Control-Allow-Headers': 'Content-Type'
             },
-            'body': json.dumps({
-                'error': f'An error occurred: {str(e)}'
-            })
+            'body': json.dumps({'error': str(e)})
         } 
